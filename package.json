@@ -1,0 +1,19 @@
+{
+  "name": "dodi-addon",
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "fixtures": "bun run scripts/print-fixtures.ts"
+  },
+  "dependencies": {
+    "jsdom": "^24.1.3",
+    "ogi-addon": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^22.15.31",
+    "typescript": "^5.8.0"
+  }
+}
