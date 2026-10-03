@@ -43,6 +43,9 @@ async function startAddon(options: {
   stubExitCode?: number;
   noInstall?: boolean;
   appName?: string;
+  textOnly?: boolean;
+  sleepSeconds?: number;
+  timeoutMs?: number;
   installDir?: string;
   inputs?: (config: Record<string, any>, run: Run) => Record<string, unknown>;
 }): Promise<Run> {
@@ -77,6 +80,9 @@ async function startAddon(options: {
         STUB_ARGV_FILE: ws.argvFile,
         STUB_GAME_EXE: ws.gameExe,
         STUB_EXIT_CODE: String(options.stubExitCode ?? 0),
+        STUB_INSTALL_TEXT_ONLY: options.textOnly ? "1" : "",
+        STUB_SLEEP: options.sleepSeconds ? String(options.sleepSeconds) : "",
+        DODI_SILENT_TIMEOUT_MS: options.timeoutMs ? String(options.timeoutMs) : "",
         STUB_NO_INSTALL: options.noInstall ? "1" : "",
         STUB_INSTALL_DIR: options.installDir ?? "",
       },
@@ -127,8 +133,16 @@ describe("handshake and configuration", () => {
       defaultValue: false,
       displayName: "Automate Setup under Wine (experimental)",
     });
-    expect(configure.args.automateWineSetup.description).toContain("DODI");
-    expect(configure.args.automateWineSetup.description).not.toContain("FitGirl");
+    const description: string = configure.args.automateWineSetup.description;
+    expect(configure.args.automateWineSetup.defaultValue).toBe(false);
+    expect(description.toLowerCase()).toContain("experimental");
+    expect(description).toContain("DODI");
+    expect(description).not.toContain("FitGirl");
+    expect(description).toContain("custom start screen and a component page");
+    expect(description).toContain("ISDone/unarc");
+    expect(description).toContain("expect it to fail");
+    expect(description).toContain("exit code and the log path");
+    expect(description).toContain("manual flow");
   });
 });
 
@@ -281,6 +295,25 @@ describe("setup, silent branch", () => {
       `Inno Setup exited with code 4: A fatal error occurred during the actual installation process. Log: ${join(run.repackDir, "dodi-setup.log")}`,
     );
     expect(readFileSync(run.setupExe, "utf-8")).toBe("stub installer");
+  });
+
+  test("a hung installer is killed after the timeout and reported with the log path", async () => {
+    const run = await startAddon({ sleepSeconds: 30, timeoutMs: 700 });
+    await enableAutomation(run);
+    const started = Date.now();
+    const response = await run.ogi.request("setup", setupArgs(run));
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(response.statusError).toContain("did not finish within 1s and was stopped");
+    expect(response.statusError).toContain(`Log: ${join(run.repackDir, "dodi-setup.log")}`);
+  });
+
+  test("a zero exit with no game executable fails with the log path instead of prompting", async () => {
+    const run = await startAddon({ textOnly: true }); // any prompt would throw
+    await enableAutomation(run);
+    const response = await run.ogi.request("setup", setupArgs(run));
+    expect(response.statusError).toBe(
+      `Unattended setup exited 0 but no game executable was found in ${join(run.repackDir, "DODI Install")}. Log: ${join(run.repackDir, "dodi-setup.log")}`,
+    );
   });
 
   test("an unrecognised exit code is reported as such", async () => {

@@ -43,7 +43,7 @@ addon.on("configure", (config) =>
       .setName("automateWineSetup")
       .setDisplayName("Automate Setup under Wine (experimental)")
       .setDescription(
-        "Experimental. On Linux or macOS, run the DODI repack's setup.exe unattended through Wine (/VERYSILENT) with no prompts, installing into a \"DODI Install\" folder next to the repack files. Whether DODI installers finish unattended is not confirmed: if setup hangs or fails, turn this off. The manual flow, which asks for the install folder and shows the setup wizard, is the default.",
+        "Experimental; expect it to fail. On Linux or macOS this runs the DODI repack's setup.exe unattended through Wine (/VERYSILENT) into a \"DODI Install\" folder next to the repack files. DODI installers have a custom start screen and a component page that unattended mode may not get past, and they unpack through ISDone/unarc, which is reported to fail under Wine/Proton. If it fails, the addon reports the Inno Setup exit code and the log path (dodi-setup.log) instead of installing, and the manual flow, which shows the setup wizard, is the way to install.",
       )
       .setDefaultValue(AUTOMATE_WINE_SETUP_DEFAULT),
   ),
@@ -210,8 +210,11 @@ addon.on("setup", (data, event) => {
         winePrefix,
         env: process.env,
         onLog: (line) => event.log(line),
+        timeoutMs: Number(process.env.DODI_SILENT_TIMEOUT_MS) || undefined,
       });
       if (!result.ok) {
+        // Fails (rather than falling back to the manual flow, like fatboy):
+        // the message carries the mapped Inno code and the log path.
         event.fail(result.message);
         return;
       }
@@ -236,7 +239,7 @@ addon.on("setup", (data, event) => {
 
       event.log(`Launching ${basename(setupExe)}. Select ${installDir} as the destination in the wizard.`);
       try {
-        const exitCode =
+        const { code: exitCode } =
           branch === "win32"
             ? await runProcess(setupExe, [], { cwd: repackDir, env: process.env, onLog: (l) => event.log(l) })
             : await runProcess(UMU_BIN, [setupExe], {
@@ -276,6 +279,12 @@ addon.on("setup", (data, event) => {
       basename(installDir),
     );
     const choice = resolveExecutableChoice(ranked);
+    if (branch === "silent" && ranked.length === 0) {
+      event.fail(
+        `Unattended setup exited 0 but no game executable was found in ${installDir}. Log: ${join(repackDir, "dodi-setup.log")}`,
+      );
+      return;
+    }
     let gameExecutable: string;
     if (choice.autoPick) {
       gameExecutable = candidateAbsolutePath(installDir, choice.autoPick.relPath);

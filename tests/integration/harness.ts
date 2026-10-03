@@ -144,9 +144,10 @@ for arg in "$@"; do
       ;;
   esac
 done
+[ -n "$STUB_SLEEP" ] && exec sleep "$STUB_SLEEP"
 if [ -n "$target" ] && [ -z "$STUB_NO_INSTALL" ]; then
   mkdir -p "$target"
-  cp "$STUB_GAME_EXE" "$target/Game.exe"
+  if [ -n "$STUB_INSTALL_TEXT_ONLY" ]; then echo hi > "$target/readme.txt"; else cp "$STUB_GAME_EXE" "$target/Game.exe"; fi
 fi
 exit "\${STUB_EXIT_CODE:-0}"
 `;

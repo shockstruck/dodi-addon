@@ -22,22 +22,47 @@ export type RunOptions = {
   cwd: string;
   env: NodeJS.ProcessEnv;
   onLog: (line: string) => void;
+  /** Kill the process (and its group) after this long. No limit when unset. */
+  timeoutMs?: number;
 };
 
-/** Spawns a process, streams its output to `onLog`, resolves with the exit code. */
+/**
+ * Spawns a process, streams its output to `onLog`, resolves with the exit
+ * code, or with `timedOut` after killing it when `timeoutMs` elapses.
+ */
 export function runProcess(
   command: string,
   args: string[],
-  { cwd, env, onLog }: RunOptions,
-): Promise<number> {
+  { cwd, env, onLog, timeoutMs }: RunOptions,
+): Promise<{ code: number; timedOut: boolean }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env });
+    const child = spawn(command, args, { cwd, env, detached: true });
+    let timedOut = false;
+    const timer = timeoutMs
+      ? setTimeout(() => {
+          timedOut = true;
+          try {
+            if (child.pid) process.kill(-child.pid, "SIGKILL");
+          } catch {
+            child.kill("SIGKILL");
+          }
+        }, timeoutMs)
+      : undefined;
     child.stdout.on("data", (data: Buffer) => onLog(data.toString()));
     child.stderr.on("data", (data: Buffer) => onLog(data.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => resolve(code ?? -1));
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? -1, timedOut });
+    });
   });
 }
+
+/** How long an unattended install may run before it is treated as hung. */
+export const SILENT_SETUP_TIMEOUT_MS = 30 * 60 * 1000;
 
 export type SilentSetupOptions = {
   umuBin: string;
@@ -48,6 +73,7 @@ export type SilentSetupOptions = {
   winePrefix: string;
   env: NodeJS.ProcessEnv;
   onLog: (line: string) => void;
+  timeoutMs?: number;
 };
 
 export type SilentSetupResult =
@@ -64,6 +90,7 @@ export async function runSilentSetup(
 ): Promise<SilentSetupResult> {
   const { umuBin, setupExe, repackDir, installDir, winePrefix, env, onLog } =
     options;
+  const timeoutMs = options.timeoutMs ?? SILENT_SETUP_TIMEOUT_MS;
   const infPath = join(repackDir, "dodi-setup.inf");
   const logPath = join(repackDir, "dodi-setup.log");
   fs.mkdirSync(installDir, { recursive: true });
@@ -78,11 +105,20 @@ export async function runSilentSetup(
 
   let exitCode: number;
   try {
-    exitCode = await runProcess(umuBin, [setupExe, ...args], {
+    const run = await runProcess(umuBin, [setupExe, ...args], {
       cwd: repackDir,
       env: { ...env, WINEPREFIX: winePrefix },
       onLog,
+      timeoutMs,
     });
+    if (run.timedOut) {
+      return {
+        ok: false,
+        log: logPath,
+        message: `Unattended setup did not finish within ${Math.round(timeoutMs / 1000)}s and was stopped; it is probably waiting on a page it cannot answer. Use the manual flow. Log: ${logPath}`,
+      };
+    }
+    exitCode = run.code;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     return {
