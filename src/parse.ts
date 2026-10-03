@@ -74,7 +74,7 @@ export function parseSearchResults(html: string): SearchHit[] {
   const hits: SearchHit[] = [];
   for (const article of document.querySelectorAll("article.post")) {
     const anchor = article.querySelector<HTMLAnchorElement>(
-      "h2.entry-title a[href]",
+      "h2.entry-title a[href], h3.entry-title a[href]",
     );
     if (!anchor) continue;
     const title = clean(anchor.textContent);

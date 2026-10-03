@@ -1,5 +1,5 @@
 import OGIAddon, { ConfigurationBuilder, type SearchResult } from "ogi-addon";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { basename, dirname, join } from "node:path";
 import {
@@ -12,6 +12,12 @@ import {
 import { pickBestHit } from "./search";
 import { browserCommand } from "./open-url";
 import { resolveUmuBin } from "./umu-path";
+import {
+  AUTOMATE_WINE_SETUP_DEFAULT,
+  decideSetupBranch,
+  describeInnoExitCode,
+} from "./wine-setup";
+import { runProcess, runSilentSetup } from "./run-setup";
 import {
   candidateAbsolutePath,
   resolveExecutableChoice,
@@ -31,11 +37,25 @@ const addon = new OGIAddon({
   storefronts: ["steam"],
 });
 
-addon.on("configure", (config) => config);
+addon.on("configure", (config) =>
+  config.addBooleanOption((option) =>
+    option
+      .setName("automateWineSetup")
+      .setDisplayName("Automate Setup under Wine (experimental)")
+      .setDescription(
+        "Experimental; expect it to fail. On Linux or macOS this runs the DODI repack's setup.exe unattended through Wine (/VERYSILENT) into a \"DODI Install\" folder next to the repack files. DODI installers have a custom start screen and a component page that unattended mode may not get past, and they unpack through ISDone/unarc, which is reported to fail under Wine/Proton. If it fails, the addon reports the Inno Setup exit code and the log path (dodi-setup.log) instead of installing, and the manual flow, which shows the setup wizard, is the way to install.",
+      )
+      .setDefaultValue(AUTOMATE_WINE_SETUP_DEFAULT),
+  ),
+);
+
+// Test seam: DODI_BASE_URL points the addon at a local server instead of the live site.
+const BASE_URL = (process.env.DODI_BASE_URL ?? DODI_ORIGIN).replace(/\/+$/, "");
 
 async function fetchText(url: string): Promise<string> {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`${url} -> HTTP ${response.status}`);
+  const target = url.startsWith(DODI_ORIGIN) ? BASE_URL + url.slice(DODI_ORIGIN.length) : url;
+  const response = await fetch(target);
+  if (!response.ok) throw new Error(`${target} -> HTTP ${response.status}`);
   return response.text();
 }
 
@@ -145,6 +165,18 @@ addon.on("request-dl", (_appID, info, event) => {
   });
 });
 
+// Until OGI has pushed a config-update, reading an option throws; treat that as the default.
+function automateWineSetup(): boolean {
+  try {
+    return (
+      addon.config.getBooleanValue("automateWineSetup") ??
+      AUTOMATE_WINE_SETUP_DEFAULT
+    );
+  } catch {
+    return AUTOMATE_WINE_SETUP_DEFAULT;
+  }
+}
+
 addon.on("setup", (data, event) => {
   event.defer();
   (async () => {
@@ -160,54 +192,87 @@ addon.on("setup", (data, event) => {
       return;
     }
 
-    const { installDir } = (await event.askForInput(
-      "DODI Repacks",
-      `Where should ${name} be installed? Choose a different folder from the one holding the repack files.`,
-      new ConfigurationBuilder().addStringOption((option) =>
-        option
-          .setName("installDir")
-          .setDisplayName("Game Installation Directory")
-          .setDescription("The setup wizard will install the game here.")
-          .setDefaultValue(repackDir)
-          .setInputType("folder"),
-      ),
-    )) as { installDir: string };
-    if (!installDir || !fs.existsSync(installDir)) {
-      event.fail("The installation directory does not exist.");
-      return;
-    }
+    const winePrefix = join(process.env.HOME ?? "", ".wine-dodi");
+    const automate = process.platform !== "win32" && automateWineSetup();
+    const branch = decideSetupBranch(process.platform, automate);
 
-    event.log(`Launching ${basename(setupExe)}. Select ${installDir} as the destination in the wizard.`);
-    const launch =
-      process.platform === "win32"
-        ? spawnSync(setupExe, [], { cwd: repackDir, stdio: "inherit" })
-        : spawnSync(UMU_BIN, [setupExe], {
-            cwd: repackDir,
-            stdio: "inherit",
-            env: {
-              ...process.env,
-              WINEPREFIX: join(process.env.HOME ?? "", ".wine-dodi"),
-            },
-          });
-    if (launch.error) {
-      event.fail(`Could not launch setup.exe: ${launch.error.message}`);
-      return;
-    }
+    let installDir: string;
+    if (branch === "silent") {
+      // DODI has no "INSTALL HERE" staging step, so install straight into a
+      // dedicated folder. It also keeps the repack's own .exe files out of the
+      // executable scan below.
+      installDir = join(repackDir, "DODI Install");
+      const result = await runSilentSetup({
+        umuBin: UMU_BIN,
+        setupExe,
+        repackDir,
+        installDir,
+        winePrefix,
+        env: process.env,
+        onLog: (line) => event.log(line),
+        // Test seams (shortened in the integration tests); defaults are 15 min idle, 30 s sampling.
+        idleLimitMs: Number(process.env.DODI_SILENT_IDLE_MS) || undefined,
+        sampleIntervalMs: Number(process.env.DODI_SILENT_SAMPLE_MS) || undefined,
+      });
+      if (!result.ok) {
+        // Fails (rather than falling back to the manual flow, like fatboy):
+        // the message carries the mapped Inno code and the log path.
+        event.fail(result.message);
+        return;
+      }
+    } else {
+      const picked = (await event.askForInput(
+        "DODI Repacks",
+        `Where should ${name} be installed? Choose a different folder from the one holding the repack files.`,
+        new ConfigurationBuilder().addStringOption((option) =>
+          option
+            .setName("installDir")
+            .setDisplayName("Game Installation Directory")
+            .setDescription("The setup wizard will install the game here.")
+            .setDefaultValue(repackDir)
+            .setInputType("folder"),
+        ),
+      )) as { installDir: string };
+      installDir = picked.installDir;
+      if (!installDir || !fs.existsSync(installDir)) {
+        event.fail("The installation directory does not exist.");
+        return;
+      }
 
-    const { finished } = (await event.askForInput(
-      "DODI Repacks",
-      `Have you finished installing ${name}?`,
-      new ConfigurationBuilder().addBooleanOption((option) =>
-        option
-          .setName("finished")
-          .setDisplayName("Finished Setup")
-          .setDescription("Tick once the installer has completed.")
-          .setDefaultValue(false),
-      ),
-    )) as { finished: boolean };
-    if (!finished) {
-      event.fail("Setup was not finished. Run it again when the installer has completed.");
-      return;
+      event.log(`Launching ${basename(setupExe)}. Select ${installDir} as the destination in the wizard.`);
+      try {
+        const { code: exitCode } =
+          branch === "win32"
+            ? await runProcess(setupExe, [], { cwd: repackDir, env: process.env, onLog: (l) => event.log(l) })
+            : await runProcess(UMU_BIN, [setupExe], {
+                cwd: repackDir,
+                env: { ...process.env, WINEPREFIX: winePrefix },
+                onLog: (l) => event.log(l),
+              });
+        if (exitCode !== 0) {
+          event.fail(`${describeInnoExitCode(exitCode)} Check that Wine/umu is installed and try again.`);
+          return;
+        }
+      } catch (error) {
+        event.fail(`Could not launch setup.exe: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+
+      const { finished } = (await event.askForInput(
+        "DODI Repacks",
+        `Have you finished installing ${name}?`,
+        new ConfigurationBuilder().addBooleanOption((option) =>
+          option
+            .setName("finished")
+            .setDisplayName("Finished Setup")
+            .setDescription("Tick once the installer has completed.")
+            .setDefaultValue(false),
+        ),
+      )) as { finished: boolean };
+      if (!finished) {
+        event.fail("Setup was not finished. Run it again when the installer has completed.");
+        return;
+      }
     }
 
     const ranked = scoreCandidates(
@@ -216,6 +281,12 @@ addon.on("setup", (data, event) => {
       basename(installDir),
     );
     const choice = resolveExecutableChoice(ranked);
+    if (branch === "silent" && ranked.length === 0) {
+      event.fail(
+        `Unattended setup exited 0 but no game executable was found in ${installDir}. Log: ${join(repackDir, "dodi-setup.log")}`,
+      );
+      return;
+    }
     let gameExecutable: string;
     if (choice.autoPick) {
       gameExecutable = candidateAbsolutePath(installDir, choice.autoPick.relPath);
