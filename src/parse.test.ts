@@ -65,6 +65,11 @@ describe("parseSearchResults", () => {
     expect(hits[2]?.size).toBeUndefined();
   });
 
+  test("also reads the front page's <h3> titles", () => {
+    const html = `<article class="post"><h3 class="entry-title"><a href="https://dodi-repacks.site/x/">12- X Game (v1) [DODI Repack]</a></h3></article>`;
+    expect(parseSearchResults(html).map((hit) => hit.name)).toEqual(["X Game"]);
+  });
+
   test("returns nothing for the no-results page", () => {
     expect(parseSearchResults(fixture("search-empty.html"))).toEqual([]);
   });
