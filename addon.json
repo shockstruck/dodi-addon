@@ -1,0 +1,8 @@
+{
+  "author": "ShockStruck",
+  "icon": "favicon.png",
+  "scripts": {
+    "preSetup": "bun --bun install --frozen-lockfile",
+    "run": "bun run ./src/main.ts"
+  }
+}
