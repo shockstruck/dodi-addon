@@ -210,7 +210,9 @@ addon.on("setup", (data, event) => {
         winePrefix,
         env: process.env,
         onLog: (line) => event.log(line),
-        timeoutMs: Number(process.env.DODI_SILENT_TIMEOUT_MS) || undefined,
+        // Test seams (shortened in the integration tests); defaults are 15 min idle, 30 s sampling.
+        idleLimitMs: Number(process.env.DODI_SILENT_IDLE_MS) || undefined,
+        sampleIntervalMs: Number(process.env.DODI_SILENT_SAMPLE_MS) || undefined,
       });
       if (!result.ok) {
         // Fails (rather than falling back to the manual flow, like fatboy):

@@ -2,6 +2,15 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { join } from "node:path";
 import {
+  KILL_GRACE_MS,
+  SILENT_IDLE_LIMIT_MS,
+  SILENT_SAMPLE_INTERVAL_MS,
+  describeDuration,
+  isStalled,
+  observe,
+  startWatch,
+} from "./stall";
+import {
   buildSilentSetupArgs,
   describeInnoExitCode,
   toWineZPath,
@@ -18,51 +27,104 @@ export function makeDodiSetupINF(installWinDir: string): string {
   return `[Setup]\nLang=en\nDir=${installWinDir}\n`;
 }
 
+export type Watchdog = {
+  /** Samples progress; any change in the returned string counts as progress. */
+  sample: () => string;
+  intervalMs: number;
+  idleLimitMs: number;
+};
+
 export type RunOptions = {
   cwd: string;
   env: NodeJS.ProcessEnv;
   onLog: (line: string) => void;
-  /** Kill the process (and its group) after this long. No limit when unset. */
-  timeoutMs?: number;
+  /** Stop the process group when `watchdog` sees no progress for `idleLimitMs`. Unset: never stop it. */
+  watchdog?: Watchdog;
 };
 
 /**
- * Spawns a process, streams its output to `onLog`, resolves with the exit
- * code, or with `timedOut` after killing it when `timeoutMs` elapses.
+ * Spawns a process in its own group and streams its output to `onLog`.
+ * Resolves with the exit code, or with `stalled: true` after SIGTERM (then
+ * SIGKILL after KILL_GRACE_MS) to the whole group when the watchdog trips.
  */
 export function runProcess(
   command: string,
   args: string[],
-  { cwd, env, onLog, timeoutMs }: RunOptions,
-): Promise<{ code: number; timedOut: boolean }> {
+  { cwd, env, onLog, watchdog }: RunOptions,
+): Promise<{ code: number; stalled: boolean }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, detached: true });
-    let timedOut = false;
-    const timer = timeoutMs
-      ? setTimeout(() => {
-          timedOut = true;
-          try {
-            if (child.pid) process.kill(-child.pid, "SIGKILL");
-          } catch {
-            child.kill("SIGKILL");
-          }
-        }, timeoutMs)
-      : undefined;
+    const child = spawn(command, args, { cwd, env, detached: !!watchdog });
+    const signalGroup = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal);
+      } catch {
+        // group already gone
+      }
+    };
+    let stalled = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let watchTimer: ReturnType<typeof setInterval> | undefined;
+    if (watchdog) {
+      let state = startWatch(watchdog.sample(), Date.now());
+      watchTimer = setInterval(() => {
+        const now = Date.now();
+        state = observe(state, watchdog.sample(), now);
+        if (!stalled && isStalled(state, now, watchdog.idleLimitMs)) {
+          stalled = true;
+          signalGroup("SIGTERM");
+          killTimer = setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS);
+        }
+      }, watchdog.intervalMs);
+    }
+    const cleanup = () => {
+      clearInterval(watchTimer);
+      clearTimeout(killTimer);
+    };
     child.stdout.on("data", (data: Buffer) => onLog(data.toString()));
     child.stderr.on("data", (data: Buffer) => onLog(data.toString()));
     child.on("error", (error) => {
-      clearTimeout(timer);
+      cleanup();
       reject(error);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? -1, timedOut });
+      cleanup();
+      // Anything the installer left in the group (Wine helpers) goes too.
+      if (stalled) signalGroup("SIGKILL");
+      resolve({ code: code ?? -1, stalled });
     });
   });
 }
 
-/** How long an unattended install may run before it is treated as hung. */
-export const SILENT_SETUP_TIMEOUT_MS = 30 * 60 * 1000;
+/** Bytes under `dir`, recursively; 0 if it does not exist. */
+function treeBytes(dir: string): number {
+  let total = 0;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    try {
+      total += entry.isDirectory() ? treeBytes(full) : fs.statSync(full).size;
+    } catch {
+      // file vanished mid-scan
+    }
+  }
+  return total;
+}
+
+/** Progress signature: the Inno log's size plus the install folder's total bytes. */
+export function sampleProgress(logPath: string, installDir: string): string {
+  let logBytes = 0;
+  try {
+    logBytes = fs.statSync(logPath).size;
+  } catch {
+    // no log yet
+  }
+  return `${logBytes}:${treeBytes(installDir)}`;
+}
 
 export type SilentSetupOptions = {
   umuBin: string;
@@ -73,7 +135,8 @@ export type SilentSetupOptions = {
   winePrefix: string;
   env: NodeJS.ProcessEnv;
   onLog: (line: string) => void;
-  timeoutMs?: number;
+  idleLimitMs?: number;
+  sampleIntervalMs?: number;
 };
 
 export type SilentSetupResult =
@@ -90,7 +153,7 @@ export async function runSilentSetup(
 ): Promise<SilentSetupResult> {
   const { umuBin, setupExe, repackDir, installDir, winePrefix, env, onLog } =
     options;
-  const timeoutMs = options.timeoutMs ?? SILENT_SETUP_TIMEOUT_MS;
+  const idleLimitMs = options.idleLimitMs ?? SILENT_IDLE_LIMIT_MS;
   const infPath = join(repackDir, "dodi-setup.inf");
   const logPath = join(repackDir, "dodi-setup.log");
   fs.mkdirSync(installDir, { recursive: true });
@@ -109,13 +172,17 @@ export async function runSilentSetup(
       cwd: repackDir,
       env: { ...env, WINEPREFIX: winePrefix },
       onLog,
-      timeoutMs,
+      watchdog: {
+        sample: () => sampleProgress(logPath, installDir),
+        intervalMs: options.sampleIntervalMs ?? SILENT_SAMPLE_INTERVAL_MS,
+        idleLimitMs,
+      },
     });
-    if (run.timedOut) {
+    if (run.stalled) {
       return {
         ok: false,
         log: logPath,
-        message: `Unattended setup did not finish within ${Math.round(timeoutMs / 1000)}s and was stopped; it is probably waiting on a page it cannot answer. Use the manual flow. Log: ${logPath}`,
+        message: `Unattended setup made no progress for ${describeDuration(idleLimitMs)} and was stopped. Log: ${logPath}`,
       };
     }
     exitCode = run.code;

@@ -144,7 +144,22 @@ for arg in "$@"; do
       ;;
   esac
 done
-[ -n "$STUB_SLEEP" ] && exec sleep "$STUB_SLEEP"
+echo $$ > "$STUB_PID_FILE"
+logfile=""
+for arg in "$@"; do
+  case "$arg" in
+    /LOG=*) logfile=$(printf '%s' "\${arg#/LOG=}" | sed 's/^Z://; s|\\\\|/|g') ;;
+  esac
+done
+if [ -n "$STUB_PROGRESS_STEPS" ]; then
+  i=0
+  while [ "$i" -lt "$STUB_PROGRESS_STEPS" ]; do echo "step $i" >> "$logfile"; sleep 0.25; i=$((i+1)); done
+fi
+if [ -n "$STUB_SLEEP" ]; then
+  sleep "$STUB_SLEEP" &
+  echo $! > "$STUB_PID_FILE.child"
+  wait
+fi
 if [ -n "$target" ] && [ -z "$STUB_NO_INSTALL" ]; then
   mkdir -p "$target"
   if [ -n "$STUB_INSTALL_TEXT_ONLY" ]; then echo hi > "$target/readme.txt"; else cp "$STUB_GAME_EXE" "$target/Game.exe"; fi
@@ -159,7 +174,7 @@ export function makeWorkspace() {
   chmodSync(stub, 0o755);
   const gameExe = join(root, "game-template.exe");
   writeFileSync(gameExe, fakeGameExe());
-  return { root, stub, gameExe, argvFile: join(root, "argv.txt"), home: join(root, "home") };
+  return { root, stub, gameExe, argvFile: join(root, "argv.txt"), pidFile: join(root, "stub.pid"), home: join(root, "home") };
 }
 
 export function readArgv(file: string): string[] {

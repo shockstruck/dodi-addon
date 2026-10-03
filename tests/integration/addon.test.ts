@@ -45,7 +45,8 @@ async function startAddon(options: {
   appName?: string;
   textOnly?: boolean;
   sleepSeconds?: number;
-  timeoutMs?: number;
+  idleMs?: number;
+  progressSteps?: number;
   installDir?: string;
   inputs?: (config: Record<string, any>, run: Run) => Record<string, unknown>;
 }): Promise<Run> {
@@ -82,7 +83,10 @@ async function startAddon(options: {
         STUB_EXIT_CODE: String(options.stubExitCode ?? 0),
         STUB_INSTALL_TEXT_ONLY: options.textOnly ? "1" : "",
         STUB_SLEEP: options.sleepSeconds ? String(options.sleepSeconds) : "",
-        DODI_SILENT_TIMEOUT_MS: options.timeoutMs ? String(options.timeoutMs) : "",
+        DODI_SILENT_IDLE_MS: options.idleMs ? String(options.idleMs) : "",
+        DODI_SILENT_SAMPLE_MS: options.idleMs ? "100" : "",
+        STUB_PROGRESS_STEPS: options.progressSteps ? String(options.progressSteps) : "",
+        STUB_PID_FILE: ws.pidFile,
         STUB_NO_INSTALL: options.noInstall ? "1" : "",
         STUB_INSTALL_DIR: options.installDir ?? "",
       },
@@ -297,14 +301,40 @@ describe("setup, silent branch", () => {
     expect(readFileSync(run.setupExe, "utf-8")).toBe("stub installer");
   });
 
-  test("a hung installer is killed after the timeout and reported with the log path", async () => {
-    const run = await startAddon({ sleepSeconds: 30, timeoutMs: 700 });
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  test("an installer that makes no progress is killed with its whole process group", async () => {
+    const run = await startAddon({ sleepSeconds: 60, idleMs: 1500 });
     await enableAutomation(run);
     const started = Date.now();
     const response = await run.ogi.request("setup", setupArgs(run));
-    expect(Date.now() - started).toBeLessThan(15_000);
-    expect(response.statusError).toContain("did not finish within 1s and was stopped");
-    expect(response.statusError).toContain(`Log: ${join(run.repackDir, "dodi-setup.log")}`);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(response.statusError).toBe(
+      `Unattended setup made no progress for 2 seconds and was stopped. Log: ${join(run.repackDir, "dodi-setup.log")}`,
+    );
+    const shellPid = Number(readFileSync(run.ws.pidFile, "utf-8"));
+    const sleepPid = Number(readFileSync(`${run.ws.pidFile}.child`, "utf-8"));
+    expect(shellPid).toBeGreaterThan(1);
+    expect(sleepPid).toBeGreaterThan(1);
+    await Bun.sleep(300);
+    expect(alive(shellPid)).toBe(false);
+    expect(alive(sleepPid)).toBe(false);
+  });
+
+  test("an installer that keeps writing its log is not killed, even past the idle limit", async () => {
+    // 12 steps x 0.25s = 3s of steady log growth against a 1.5s idle limit.
+    const run = await startAddon({ progressSteps: 12, idleMs: 1500 });
+    await enableAutomation(run);
+    const response = await run.ogi.request("setup", setupArgs(run));
+    expect(response.statusError).toBeUndefined();
+    expect(response.args).toMatchObject({ launchExecutable: join(run.repackDir, "DODI Install", "Game.exe") });
   });
 
   test("a zero exit with no game executable fails with the log path instead of prompting", async () => {
