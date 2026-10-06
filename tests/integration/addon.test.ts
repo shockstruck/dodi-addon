@@ -243,7 +243,7 @@ describe("request-dl", () => {
     );
     expect(response.args).toMatchObject({
       downloadType: "empty",
-      name: "Torrent | ELDEN RING",
+      name: "Torrent | Torrent (repack) | Elden Ring",
       manifest: {
         service: "local",
         setupExe: run.setupExe,
