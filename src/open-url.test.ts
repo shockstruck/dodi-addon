@@ -17,4 +17,12 @@ describe("browserCommand", () => {
     expect(browserCommand("magnet:?xt=urn:btih:abc", "linux")).toBeNull();
     expect(browserCommand("nope", "linux")).toBeNull();
   });
+
+  test("an override command replaces the platform opener but keeps the http(s) check", () => {
+    expect(browserCommand("https://a.test/x", "linux", "/opt/stub")).toEqual({
+      command: "/opt/stub",
+      args: ["https://a.test/x"],
+    });
+    expect(browserCommand("file:///etc/passwd", "linux", "/opt/stub")).toBeNull();
+  });
 });

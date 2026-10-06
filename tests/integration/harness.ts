@@ -167,14 +167,22 @@ fi
 exit "\${STUB_EXIT_CODE:-0}"
 `;
 
+/** Stub for the browser opener (`DODI_OPEN_CMD`): records its argv, one arg per line. */
+const OPEN_STUB_SCRIPT = `#!/bin/sh
+printf '%s\\n' "$@" > "$STUB_OPEN_FILE"
+`;
+
 export function makeWorkspace() {
   const root = mkdtempSync(join(tmpdir(), "dodi-it-"));
   const stub = join(root, "umu-run-stub");
   writeFileSync(stub, STUB_SCRIPT);
   chmodSync(stub, 0o755);
+  const openStub = join(root, "open-stub");
+  writeFileSync(openStub, OPEN_STUB_SCRIPT);
+  chmodSync(openStub, 0o755);
   const gameExe = join(root, "game-template.exe");
   writeFileSync(gameExe, fakeGameExe());
-  return { root, stub, gameExe, argvFile: join(root, "argv.txt"), pidFile: join(root, "stub.pid"), home: join(root, "home") };
+  return { root, stub, openStub, openFile: join(root, "open.txt"), gameExe, argvFile: join(root, "argv.txt"), pidFile: join(root, "stub.pid"), home: join(root, "home") };
 }
 
 export function readArgv(file: string): string[] {
