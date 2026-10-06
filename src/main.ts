@@ -10,6 +10,7 @@ import {
   type GamePage,
 } from "./parse";
 import { pickBestHit } from "./search";
+import { buildPageResults, requestService, searchLogLine } from "./results";
 import { browserCommand } from "./open-url";
 import { resolveUmuBin } from "./umu-path";
 import {
@@ -59,9 +60,11 @@ async function fetchText(url: string): Promise<string> {
   return response.text();
 }
 
-const pageCache = new Map<string, GamePage | null>();
+type Lookup = { hits: number; best: string | null; page: GamePage | null };
 
-async function lookupGame(name: string): Promise<GamePage | null> {
+const pageCache = new Map<string, Lookup>();
+
+async function lookupGame(name: string): Promise<Lookup> {
   const key = name.toLowerCase();
   if (pageCache.has(key)) return pageCache.get(key)!;
   const hits = parseSearchResults(await fetchText(buildSearchUrl(name)));
@@ -69,8 +72,9 @@ async function lookupGame(name: string): Promise<GamePage | null> {
   const page = best
     ? parseGamePage(await fetchText(best.url), best.url)
     : null;
-  pageCache.set(key, page);
-  return page;
+  const lookup = { hits: hits.length, best: best?.name ?? null, page };
+  pageCache.set(key, lookup);
+  return lookup;
 }
 
 const localFiles = (): SearchResult => ({
@@ -85,18 +89,10 @@ addon.on("search", (data, event) => {
     try {
       if (data.for !== "task") {
         const game = await addon.getAppDetails(data.appID, data.storefront);
-        const page = game ? await lookupGame(game.name) : null;
-        for (const group of page?.groups ?? []) {
-          results.push({
-            downloadType: "task",
-            taskName: "open-download-page",
-            name: `${group.label} (${group.kind === "repack" ? "repack" : "update"}) | ${page!.name}`,
-            manifest: {
-              pageUrl: page!.url,
-              label: group.label,
-              urls: group.links.map((link) => link.url),
-            },
-          });
+        if (game) {
+          const { hits, best, page } = await lookupGame(game.name);
+          console.log(searchLogLine(game.name, hits, best, page?.groups.length ?? 0));
+          results.push(...buildPageResults(page));
         }
       }
     } catch (error) {
@@ -113,55 +109,103 @@ addon.on("search", (data, event) => {
 });
 
 // DODI links go through hoster pages (captcha / countdown), so the addon does
-// not resolve them to a file URL. This task opens the page in the user's browser.
+// not resolve them to a file URL. It opens the page in the user's browser.
+// Test seam: DODI_OPEN_CMD replaces the platform opener.
+function openFirstLink(urls: string[], log: (line: string) => void): boolean {
+  const first = urls[0] ? browserCommand(urls[0], process.platform, process.env.DODI_OPEN_CMD) : null;
+  if (!first) return false;
+  log(`Opening ${urls[0]}`);
+  for (const mirror of urls.slice(1)) log(`Mirror: ${mirror}`);
+  const child = spawn(first.command, first.args, { stdio: "ignore", detached: true });
+  child.on("error", (error) => log(`Could not open a browser: ${error.message}`));
+  child.unref();
+  return true;
+}
+
+const manifestUrls = (manifest: Record<string, unknown>): string[] =>
+  Array.isArray(manifest.urls) ? (manifest.urls as string[]) : [];
+
+// Kept for backward compatibility; search no longer emits task results because
+// OGI hides them for games the user does not own.
 addon.onTask("open-download-page", async (task, { manifest }) => {
-  const urls = Array.isArray(manifest.urls) ? (manifest.urls as string[]) : [];
-  const first = urls[0] ? browserCommand(urls[0], process.platform) : null;
-  if (!first) {
+  const urls = manifestUrls(manifest);
+  const valid = urls.filter((url) => browserCommand(url, process.platform));
+  if (!openFirstLink(valid, (line) => task.log(line))) {
     task.fail("No valid http(s) download link to open.");
     return;
   }
-  task.log(`Opening ${urls[0]}`);
-  for (const mirror of urls.slice(1)) task.log(`Mirror: ${mirror}`);
   task.log(
     `Post: ${String(manifest.pageUrl ?? DODI_ORIGIN)}. When the download finishes, extract it and add the game via "Local Files".`,
   );
-  const child = spawn(first.command, first.args, { stdio: "ignore", detached: true });
-  child.on("error", (error) => task.log(`Could not open a browser: ${error.message}`));
-  child.unref();
   task.complete();
 });
 
+// Shared by the "local" and "page" flows: ask for the extracted repack's
+// setup.exe and resolve it as an `empty` download that `setup` picks up.
+type SetupExeEvent = {
+  askForInput(screen: string, description: string, config: ConfigurationBuilder): Promise<unknown>;
+  fail(message: string): void;
+  resolve(data: SearchResult): void;
+};
+
+async function askForSetupExe(
+  info: SearchResult,
+  event: SetupExeEvent,
+  label: string,
+  description: string,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  const { setupExe } = (await event.askForInput(
+    "DODI Repacks",
+    description,
+    new ConfigurationBuilder().addStringOption((option) =>
+      option
+        .setName("setupExe")
+        .setDisplayName("setup.exe")
+        .setDescription("The installer in your extracted repack directory")
+        .setInputType("file"),
+    ),
+  )) as { setupExe: string };
+  if (!setupExe || !fs.existsSync(setupExe)) {
+    event.fail("The selected setup.exe does not exist.");
+    return;
+  }
+  event.resolve({
+    name: `${label} | ${info.name}`,
+    downloadType: "empty",
+    manifest: {
+      service: "local",
+      setupExe,
+      pathOfSetupExe: dirname(setupExe),
+      ...extra,
+    },
+  });
+}
+
 addon.on("request-dl", (_appID, info, event) => {
   event.defer(async () => {
-    if (info.manifest?.service !== "local") {
-      event.fail("Unknown download request.");
-      return;
+    const manifest = (info.manifest ?? {}) as Record<string, unknown>;
+    switch (requestService(manifest)) {
+      case "local":
+        await askForSetupExe(info, event, "Local Files", "Select the repack's setup.exe");
+        return;
+      case "page": {
+        if (!openFirstLink(manifestUrls(manifest).filter((url) => browserCommand(url, process.platform)), (line) => event.log(line))) {
+          event.fail("No valid http(s) download link to open.");
+          return;
+        }
+        await askForSetupExe(
+          info,
+          event,
+          String(manifest.label ?? "DODI Repacks"),
+          "Download the repack in your browser, extract it, then select its setup.exe",
+          { pageUrl: manifest.pageUrl },
+        );
+        return;
+      }
+      default:
+        event.fail("Unknown download request.");
     }
-    const { setupExe } = (await event.askForInput(
-      "DODI Repacks",
-      "Select the repack's setup.exe",
-      new ConfigurationBuilder().addStringOption((option) =>
-        option
-          .setName("setupExe")
-          .setDisplayName("setup.exe")
-          .setDescription("The installer in your extracted repack directory")
-          .setInputType("file"),
-      ),
-    )) as { setupExe: string };
-    if (!setupExe || !fs.existsSync(setupExe)) {
-      event.fail("The selected setup.exe does not exist.");
-      return;
-    }
-    event.resolve({
-      name: `Local Files | ${info.name}`,
-      downloadType: "empty",
-      manifest: {
-        service: "local",
-        setupExe,
-        pathOfSetupExe: dirname(setupExe),
-      },
-    });
   });
 });
 

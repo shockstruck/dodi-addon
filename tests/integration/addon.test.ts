@@ -78,6 +78,8 @@ async function startAddon(options: {
         HOME: ws.home,
         DODI_BASE_URL: site.baseUrl,
         OGI_UMU_RUN: ws.stub,
+        DODI_OPEN_CMD: ws.openStub,
+        STUB_OPEN_FILE: ws.openFile,
         STUB_ARGV_FILE: ws.argvFile,
         STUB_GAME_EXE: ws.gameExe,
         STUB_EXIT_CODE: String(options.stubExitCode ?? 0),
@@ -151,13 +153,15 @@ describe("handshake and configuration", () => {
 });
 
 describe("search", () => {
-  test("returns the six fixture groups plus Local Files, last, with no network", async () => {
+  test("returns the six fixture groups as request results plus Local Files, last, with no task results", async () => {
     const run = await startAddon({});
     const response = await run.ogi.request("search", { appID: 1245620, storefront: "steam", for: "game" });
     expect(response.statusError).toBeUndefined();
     const results = response.args as any[];
 
-    const groups = results.filter((r) => r.downloadType === "task");
+    expect(results.some((r) => r.downloadType === "task")).toBe(false);
+    const groups = results.filter((r) => r.manifest.service === "page");
+    expect(groups.every((r) => r.downloadType === "request")).toBe(true);
     expect(groups.map((r) => r.manifest.label)).toEqual([
       "Torrent",
       "SwiftUploads",
@@ -166,7 +170,6 @@ describe("search", () => {
       "Update v1.17 / Tarnished Pack",
       "Alternative links",
     ]);
-    expect(groups.every((r) => r.taskName === "open-download-page")).toBe(true);
     expect(groups[0].manifest.urls).toEqual([
       "http://file-me.top/erut1gx2w5s1.html",
       "https://www.up-4ever.net/osw2tzsu5o8r",
@@ -177,6 +180,12 @@ describe("search", () => {
 
     expect(results).toHaveLength(7);
     expect(results.at(-1)).toMatchObject({ downloadType: "request", name: "Local Files", manifest: { service: "local" } });
+  });
+
+  test("logs one title-only line per lookup", async () => {
+    const run = await startAddon({});
+    await run.ogi.request("search", { appID: 1245620, storefront: "steam", for: "game" });
+    expect(run.output()).toMatch(/DODI lookup for "ELDEN RING": \d+ hits, best "[^"]+", 6 groups/);
   });
 
   test("a title with no DODI listing still offers Local Files", async () => {
@@ -206,6 +215,69 @@ describe("request-dl", () => {
       downloadType: "empty",
       manifest: { service: "local", setupExe: run.setupExe, pathOfSetupExe: run.repackDir },
     });
+  });
+
+  test("a page request opens the first link in the browser, asks for setup.exe and resolves a local empty download", async () => {
+    const run = await startAddon({
+      inputs: (config, r) => (config.setupExe ? { setupExe: r.setupExe } : undefined as never),
+    });
+    const response = await run.ogi.request("request-dl", {
+      appID: 1245620,
+      info: {
+        downloadType: "request",
+        name: "Torrent (repack) | Elden Ring",
+        manifest: {
+          service: "page",
+          pageUrl: "https://dodi.example.invalid/elden-ring/",
+          label: "Torrent",
+          urls: ["file:///etc/passwd", "https://hoster-a.example.invalid/a", "https://hoster-b.example.invalid/b"],
+        },
+      },
+    });
+    expect(response.statusError).toBeUndefined();
+    // The first valid http(s) URL is opened; the rejected file: URL is skipped.
+    expect(readArgv(run.ws.openFile)).toEqual(["https://hoster-a.example.invalid/a"]);
+    const prompt = run.ogi.received.find((m) => m.event === "input-asked")!;
+    expect(prompt.args.description).toBe(
+      "Download the repack in your browser, extract it, then select its setup.exe",
+    );
+    expect(response.args).toMatchObject({
+      downloadType: "empty",
+      name: "Torrent | Torrent (repack) | Elden Ring",
+      manifest: {
+        service: "local",
+        setupExe: run.setupExe,
+        pathOfSetupExe: run.repackDir,
+        pageUrl: "https://dodi.example.invalid/elden-ring/",
+      },
+    });
+  });
+
+  test("a page request with no valid link fails before asking for anything", async () => {
+    const run = await startAddon({});
+    const response = await run.ogi.request("request-dl", {
+      appID: 1245620,
+      info: { downloadType: "request", name: "x", manifest: { service: "page", urls: ["magnet:?xt=1"] } },
+    });
+    expect(response.statusError).toContain("No valid http(s) download link");
+  });
+
+  test("a page request fails with the existing message when setup.exe is missing", async () => {
+    const run = await startAddon({ inputs: () => ({ setupExe: "/nonexistent/setup.exe" }) });
+    const response = await run.ogi.request("request-dl", {
+      appID: 1245620,
+      info: { downloadType: "request", name: "x", manifest: { service: "page", urls: ["https://hoster-a.example.invalid/a"] } },
+    });
+    expect(response.statusError).toContain("The selected setup.exe does not exist.");
+  });
+
+  test("an unknown service still fails", async () => {
+    const run = await startAddon({});
+    const response = await run.ogi.request("request-dl", {
+      appID: 1,
+      info: { downloadType: "request", name: "x", manifest: { service: "torrent" } },
+    });
+    expect(response.statusError).toBe("Unknown download request.");
   });
 
   test("fails when the chosen setup.exe does not exist", async () => {
